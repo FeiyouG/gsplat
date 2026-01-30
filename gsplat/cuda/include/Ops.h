@@ -12,7 +12,8 @@ namespace gsplat {
 at::Tensor null(const at::Tensor input);
 
 // Project 3D gaussians (in camera space) to 2D image planes with EWA splatting.
-std::tuple<at::Tensor, at::Tensor> projection_ewa_simple_fwd(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+projection_ewa_simple_fwd(
     const at::Tensor means,  // [..., C, N, 3]
     const at::Tensor covars, // [..., C, N, 3, 3]
     const at::Tensor Ks,     // [..., C, 3, 3]
@@ -27,8 +28,10 @@ std::tuple<at::Tensor, at::Tensor> projection_ewa_simple_bwd(
     const uint32_t width,
     const uint32_t height,
     const CameraModelType camera_model,
-    const at::Tensor v_means2d, // [..., C, N, 2]
-    const at::Tensor v_covars2d // [..., C, N, 2, 2]
+    const at::Tensor v_means2d,    // [..., C, N, 2]
+    const at::Tensor v_covars2d,   // [..., C, N, 2, 2]
+    const at::Tensor v_ray_planes, // [..., C, 2] optional
+    const at::Tensor v_normals     // [..., C, 3] optional
 );
 
 // Fuse the following operations:
@@ -40,6 +43,9 @@ std::tuple<at::Tensor, at::Tensor> projection_ewa_simple_bwd(
 //    - w/ minimum radius check
 // 4. add a bit blurring to the 2D gaussians for anti-aliasing.
 std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
     at::Tensor,
     at::Tensor,
     at::Tensor,
@@ -84,6 +90,9 @@ projection_ewa_3dgs_fused_bwd(
     const at::Tensor v_depths,                      // [..., C, N]
     const at::Tensor v_conics,                      // [..., C, N, 3]
     const at::optional<at::Tensor> v_compensations, // [..., C, N] optional
+    const at::optional<at::Tensor> v_ray_ts,        // [..., C, N] optional
+    const at::optional<at::Tensor> v_ray_planes,    // [..., C, 2] optional
+    const at::optional<at::Tensor> v_normals,       // [..., C, 3] optional
     const bool viewmats_requires_grad
 );
 
@@ -96,6 +105,9 @@ projection_ewa_3dgs_fused_bwd(
 // sparsity is high, i.e., most of the gaussians are not in the camera frustum.
 // But at the cost of slightly slower speed.
 std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
     at::Tensor,
     at::Tensor,
     at::Tensor,
@@ -146,6 +158,9 @@ projection_ewa_3dgs_packed_bwd(
     const at::Tensor v_depths,                      // [nnz]
     const at::Tensor v_conics,                      // [nnz, 3]
     const at::optional<at::Tensor> v_compensations, // [nnz] optional
+    const at::optional<at::Tensor> v_ray_ts,        // [nnz] optional
+    const at::optional<at::Tensor> v_ray_planes,    // [nnz, 2] optional
+    const at::optional<at::Tensor> v_normals,       // [nnz, 3] optional
     const bool viewmats_requires_grad,
     const bool sparse_grad
 );
@@ -220,44 +235,72 @@ std::tuple<at::Tensor, at::Tensor> quat_scale_to_covar_preci_bwd(
 );
 
 // Rasterize 3D Gaussian to pixels
-std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
+std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor>
+rasterize_to_pixels_3dgs_fwd(
     // Gaussian parameters
-    const at::Tensor means2d,   // [..., N, 2] or [nnz, 2]
-    const at::Tensor conics,    // [..., N, 3] or [nnz, 3]
-    const at::Tensor colors,    // [..., N, channels] or [nnz, channels]
-    const at::Tensor opacities, // [..., N]  or [nnz]
+    const at::Tensor means2d,    // [..., N, 2] or [nnz, 2]
+    const at::Tensor conics,     // [..., N, 3] or [nnz, 3]
+    const at::Tensor colors,     // [..., N, channels] or [nnz, channels]
+    const at::Tensor opacities,  // [..., N]  or [nnz]
+    const at::Tensor ray_ts,     // [..., N] or [nnz]
+    const at::Tensor ray_planes, // [..., N, 2] optional or [nnz, 2]
+    const at::Tensor normals,    // [..., N, 3] optional or [nnz, 3]
     const at::optional<at::Tensor> backgrounds, // [..., channels]
-    const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
+    const at::optional<at::Tensor> masks, // [..., tile_height, tile_width]
     // image size
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
+    const at::Tensor Ks, // [..., C, 9]
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids   // [n_isects]
 );
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor>
 rasterize_to_pixels_3dgs_bwd(
     // Gaussian parameters
     const at::Tensor means2d,                   // [..., N, 2] or [nnz, 2]
     const at::Tensor conics,                    // [..., N, 3] or [nnz, 3]
     const at::Tensor colors,                    // [..., N, 3] or [nnz, 3]
     const at::Tensor opacities,                 // [..., N] or [nnz]
+    const at::Tensor ray_ts,                    // [..., N] or [nnz]
+    const at::Tensor ray_planes,                // [..., N, 2] or [nnz, 2]
+    const at::Tensor normals,                   // [..., N, 3] or [nnz, 3]
     const at::optional<at::Tensor> backgrounds, // [..., 3]
-    const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
+    const at::optional<at::Tensor> masks, // [..., tile_height, tile_width]
     // image size
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
+    const at::Tensor Ks, // [..., C, 9]
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
     // forward outputs
     const at::Tensor render_alphas, // [..., image_height, image_width, 1]
     const at::Tensor last_ids,      // [..., image_height, image_width]
+    const at::Tensor median_ids,    // [..., image_height, image_width]
     // gradients of outputs
-    const at::Tensor v_render_colors, // [..., image_height, image_width, 3]
-    const at::Tensor v_render_alphas, // [..., image_height, image_width, 1]
+    const at::Tensor v_render_colors,    // [..., image_height, image_width, 3]
+    const at::Tensor v_render_alphas,    // [..., image_height, image_width, 1]
+    const at::Tensor v_expected_depths,  // [..., image_height, image_width, 1]
+    const at::Tensor v_median_depths,    // [..., image_height, image_width, 1]
+    const at::Tensor v_expected_normals, // [..., image_height, image_width, 3]
     // options
     bool absgrad
 );
@@ -364,9 +407,9 @@ projection_2dgs_packed_bwd(
     const uint32_t image_width,
     const uint32_t image_height,
     // fwd outputs
-    const at::Tensor batch_ids,    // [nnz]
-    const at::Tensor camera_ids,   // [nnz]
-    const at::Tensor gaussian_ids, // [nnz]
+    const at::Tensor batch_ids,      // [nnz]
+    const at::Tensor camera_ids,     // [nnz]
+    const at::Tensor gaussian_ids,   // [nnz]
     const at::Tensor ray_transforms, // [nnz, 3, 3]
     // grad outputs
     const at::Tensor v_means2d,        // [nnz, 2]
@@ -393,7 +436,7 @@ rasterize_to_pixels_2dgs_fwd(
     const at::Tensor opacities,      // [..., N]  or [nnz]
     const at::Tensor normals,        // [..., N, 3] or [nnz, 3]
     const at::optional<at::Tensor> backgrounds, // [..., channels]
-    const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
+    const at::optional<at::Tensor> masks, // [..., tile_height, tile_width]
     // image size
     const uint32_t image_width,
     const uint32_t image_height,
@@ -419,7 +462,7 @@ rasterize_to_pixels_2dgs_bwd(
     const at::Tensor normals,        // [..., N, 3] or [nnz, 3]
     const at::Tensor densify,
     const at::optional<at::Tensor> backgrounds, // [..., 3]
-    const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
+    const at::optional<at::Tensor> masks, // [..., tile_height, tile_width]
     // image size
     const uint32_t image_width,
     const uint32_t image_height,
@@ -428,7 +471,8 @@ rasterize_to_pixels_2dgs_bwd(
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
     // forward outputs
-    const at::Tensor render_colors, // [..., image_height, image_width, COLOR_DIM]
+    const at::Tensor
+        render_colors, // [..., image_height, image_width, COLOR_DIM]
     const at::Tensor render_alphas, // [..., image_height, image_width, 1]
     const at::Tensor last_ids,      // [..., image_height, image_width]
     const at::Tensor median_ids,    // [..., image_height, image_width]
@@ -474,8 +518,8 @@ projection_ut_3dgs_fused(
     const at::optional<at::Tensor> opacities, // [..., N] optional
     const at::Tensor viewmats0,               // [..., C, 4, 4]
     const at::optional<at::Tensor>
-        viewmats1,                            // [..., C, 4, 4] optional for rolling shutter
-    const at::Tensor Ks,                      // [..., C, 3, 3]
+        viewmats1,       // [..., C, 4, 4] optional for rolling shutter
+    const at::Tensor Ks, // [..., C, 3, 3]
     const uint32_t image_width,
     const uint32_t image_height,
     const float eps2d,
@@ -487,10 +531,12 @@ projection_ut_3dgs_fused(
     // uncented transform
     const UnscentedTransformParameters ut_params,
     ShutterType rs_type,
-    const at::optional<at::Tensor> radial_coeffs,     // [..., C, 6] or [..., C, 4] optional
+    const at::optional<at::Tensor>
+        radial_coeffs, // [..., C, 6] or [..., C, 4] optional
     const at::optional<at::Tensor> tangential_coeffs, // [..., C, 2] optional
-    const at::optional<at::Tensor> thin_prism_coeffs,  // [..., C, 4] optional
-    const FThetaCameraDistortionParameters ftheta_coeffs // shared parameters for all cameras
+    const at::optional<at::Tensor> thin_prism_coeffs, // [..., C, 4] optional
+    const FThetaCameraDistortionParameters
+        ftheta_coeffs // shared parameters for all cameras
 );
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
@@ -502,24 +548,26 @@ rasterize_to_pixels_from_world_3dgs_fwd(
     const at::Tensor colors,    // [..., C, N, channels] or [nnz, channels]
     const at::Tensor opacities, // [..., C, N] or [nnz]
     const at::optional<at::Tensor> backgrounds, // [..., C, channels]
-    const at::optional<at::Tensor> masks,       // [..., C, tile_height, tile_width]
+    const at::optional<at::Tensor> masks, // [..., C, tile_height, tile_width]
     // image size
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
     // camera
-    const at::Tensor viewmats0,     // [..., C, 4, 4]
+    const at::Tensor viewmats0, // [..., C, 4, 4]
     const at::optional<at::Tensor>
-        viewmats1,                  // [..., C, 4, 4] optional for rolling shutter
-    const at::Tensor Ks,            // [..., C, 3, 3]
+        viewmats1,       // [..., C, 4, 4] optional for rolling shutter
+    const at::Tensor Ks, // [..., C, 3, 3]
     const CameraModelType camera_model,
     // uncented transform
     const UnscentedTransformParameters ut_params,
     ShutterType rs_type,
-    const at::optional<at::Tensor> radial_coeffs,     // [..., C, 6] or [..., C, 4] optional
+    const at::optional<at::Tensor>
+        radial_coeffs, // [..., C, 6] or [..., C, 4] optional
     const at::optional<at::Tensor> tangential_coeffs, // [..., C, 2] optional
     const at::optional<at::Tensor> thin_prism_coeffs, // [..., C, 4] optional
-    const FThetaCameraDistortionParameters ftheta_coeffs, // shared parameters for all cameras
+    const FThetaCameraDistortionParameters
+        ftheta_coeffs, // shared parameters for all cameras
     // intersections
     const at::Tensor tile_offsets, // [..., C, tile_height, tile_width]
     const at::Tensor flatten_ids   // [n_isects]
@@ -534,30 +582,32 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     const at::Tensor colors,                    // [..., C, N, 3] or [nnz, 3]
     const at::Tensor opacities,                 // [..., C, N] or [nnz]
     const at::optional<at::Tensor> backgrounds, // [..., C, 3]
-    const at::optional<at::Tensor> masks,       // [..., C, tile_height, tile_width]
+    const at::optional<at::Tensor> masks, // [..., C, tile_height, tile_width]
     // image size
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
     // camera
-    const at::Tensor viewmats0,      // [..., C, 4, 4]
+    const at::Tensor viewmats0, // [..., C, 4, 4]
     const at::optional<at::Tensor>
-        viewmats1,                   // [..., C, 4, 4] optional for rolling shutter
-    const at::Tensor Ks,             // [..., C, 3, 3]
+        viewmats1,       // [..., C, 4, 4] optional for rolling shutter
+    const at::Tensor Ks, // [..., C, 3, 3]
     const CameraModelType camera_model,
     // uncented transform
     const UnscentedTransformParameters ut_params,
     ShutterType rs_type,
-    const at::optional<at::Tensor> radial_coeffs,     // [..., C, 6] or [..., C, 4] optional
+    const at::optional<at::Tensor>
+        radial_coeffs, // [..., C, 6] or [..., C, 4] optional
     const at::optional<at::Tensor> tangential_coeffs, // [..., C, 2] optional
     const at::optional<at::Tensor> thin_prism_coeffs, // [..., C, 4] optional
-    const FThetaCameraDistortionParameters ftheta_coeffs, // shared parameters for all cameras
+    const FThetaCameraDistortionParameters
+        ftheta_coeffs, // shared parameters for all cameras
     // intersections
-    const at::Tensor tile_offsets,    // [..., C, tile_height, tile_width]
-    const at::Tensor flatten_ids,     // [n_isects]
+    const at::Tensor tile_offsets, // [..., C, tile_height, tile_width]
+    const at::Tensor flatten_ids,  // [n_isects]
     // forward outputs
-    const at::Tensor render_alphas,   // [..., C, image_height, image_width, 1]
-    const at::Tensor last_ids,        // [..., C, image_height, image_width]
+    const at::Tensor render_alphas, // [..., C, image_height, image_width, 1]
+    const at::Tensor last_ids,      // [..., C, image_height, image_width]
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., C, image_height, image_width, 3]
     const at::Tensor v_render_alphas  // [..., C, image_height, image_width, 1]
