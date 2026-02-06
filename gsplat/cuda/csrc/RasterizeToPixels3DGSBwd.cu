@@ -259,23 +259,23 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                         accum += backgrounds[k] * v_render_c[k];
                     }
                     v_alpha += -T_final * ra * accum;
-
-                    v_normal_local = fac * v_render_en;
-                    v_alpha += glm::dot(normal_batch[t] * T - normal_buffer * ra, v_render_en);
-                    normal_buffer += normal_batch[t] * fac;
-    
-                    v_ray_t_local = fac * v_render_et;
-                    if (batch_end - t == median_idx)
-                    {
-                        v_ray_t_local += v_render_mt;
-                    }
-                    v_ray_plane_local = v_ray_t_local * delta;
-                    const float ray_t = ray_t_batch[t];
-                    const vec2 ray_plane = ray_plane_batch[t];
-                    float t_opt = ray_t + glm::dot(delta, ray_plane);
-                    v_alpha += (t_opt * T - t_buffer * ra) * v_render_et;
-                    t_buffer += t_opt * fac;   
                 }
+
+                // depth/normal gradients (always computed, independent of backgrounds)
+                v_normal_local = fac * v_render_en;
+                v_alpha += glm::dot(normal_batch[t] * T - normal_buffer * ra, v_render_en);
+                normal_buffer += normal_batch[t] * fac;
+
+                v_ray_t_local = fac * v_render_et;
+                if (batch_end - t == median_idx) {
+                    v_ray_t_local += v_render_mt;
+                }
+                v_ray_plane_local = v_ray_t_local * delta;
+                const float ray_t = ray_t_batch[t];
+                const vec2 ray_plane = ray_plane_batch[t];
+                float t_opt = ray_t + glm::dot(delta, ray_plane);
+                v_alpha += (t_opt * T - t_buffer * ra) * v_render_et;
+                t_buffer += t_opt * fac;
                 
 
 

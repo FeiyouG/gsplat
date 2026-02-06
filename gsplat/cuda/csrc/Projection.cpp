@@ -38,8 +38,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> projection_ewa_simple
     at::DimVector covars2d_shape(batch_dims);
     covars2d_shape.append({C, N, 2, 2});
     at::Tensor covars2d = at::empty(covars2d_shape, opt);
-    at::Tensor ray_planes = at::empty({C, N, 2}, opt);
-    at::Tensor normals = at::empty({C, N, 3}, opt);
+
+    at::DimVector ray_planes_shape(batch_dims);
+    ray_planes_shape.append({C, N, 2});
+    at::Tensor ray_planes = at::empty(ray_planes_shape, opt);
+
+    at::DimVector normals_shape(batch_dims);
+    normals_shape.append({C, N, 3});
+    at::Tensor normals = at::empty(normals_shape, opt);
 
     launch_projection_ewa_simple_fwd_kernel(
         // inputs

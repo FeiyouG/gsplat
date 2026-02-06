@@ -85,7 +85,7 @@ __global__ void projection_ewa_simple_fwd_kernel(
         ray_planes[i] = ray_plane[i];
     }
 #pragma unroll
-    for (uint32_t i = 0; i < 2; i++) {
+    for (uint32_t i = 0; i < 3; i++) {
         normals[i] = normal[i];
     }
 }

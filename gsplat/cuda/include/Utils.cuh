@@ -846,26 +846,16 @@ inline __device__ void persp_proj_vjp(
     float v_mean3d_y = -fy * rz2 * v_J[2][1] + v_v * rz - v_nJ_T[1][2] * rz2 +
                        (v_nJ_T[2][0] * tx + v_nJ_T[2][2] * z) * (-ty / l3) +
                        v_nJ_T[2][1] * (1 / l - ty * ty / l3) + v_l * ty / l;
-    if(x * rz <= lim_x_pos && x * rz >= -lim_x_neg) {
-        v_mean3d.x += -fx * rz2 * v_J[2][0];
+    if (x * rz <= lim_x_pos && x * rz >= -lim_x_neg) {
         v_mean3d_.x += v_mean3d_x;
-    }
-    else {
-        v_mean3d.z += -fx * rz3 * v_J[2][0] * tx;
-        // v_mean3d.z += -fx * rz3 * v_J[2][0] * tx;
+    } else {
         v_mean3d_.z += v_mean3d_x * u;
     }
     if (y * rz <= lim_y_pos && y * rz >= -lim_y_neg) {
-        v_mean3d.y += -fy * rz2 * v_J[2][1];
         v_mean3d_.y += v_mean3d_y;
     } else {
-        v_mean3d.z += -fy * rz3 * v_J[2][1] * ty;
-        // v_mean3d.z += -fy * rz3 * v_J[2][1] * ty;
         v_mean3d_.z += v_mean3d_y * v;
     }
-    v_mean3d.z += -fx * rz2 * v_J[0][0] - fy * rz2 * v_J[1][1] +
-                  2.f * fx * tx * rz3 * v_J[2][0] +
-                  2.f * fy * ty * rz3 * v_J[2][1];
     v_mean3d_.z += -fx * rz2 * v_J[0][0] - fy * rz2 * v_J[1][1] +
                    2.f * fx * tx * rz3 * v_J[2][0] +
                    2.f * fy * ty * rz3 * v_J[2][1] -
