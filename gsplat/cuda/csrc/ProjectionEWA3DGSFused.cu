@@ -40,7 +40,8 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel(
 
     scalar_t *__restrict__ ray_ts,       // [B, C, N] optional
     scalar_t *__restrict__ ray_planes,   // [B, C, 2] optional
-    scalar_t *__restrict__ normals      // [B, C, 3] optional
+    scalar_t *__restrict__ normals,      // [B, C, 3] optional
+    const bool radegs
 ) {
     // parallelize over B * C * N.
     uint32_t idx = cg::this_grid().thread_rank();
@@ -79,7 +80,10 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel(
         return;
     }
 
-    scalar_t ray_t = glm::length(mean_c);
+    scalar_t ray_t = 0.f;
+    if (radegs && ray_ts != nullptr) {
+        ray_t = glm::length(mean_c);
+    }
 
     // transform Gaussian covariance to camera space
     mat3 covar;
@@ -126,8 +130,8 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel(
             image_height,
             covar2d,
             mean2d,
-            ray_plane,
-            normal
+            radegs ? &ray_plane : nullptr,
+            radegs ? &normal : nullptr
         );
         break;
     case CameraModelType::ORTHO: // orthographic projection
@@ -220,12 +224,14 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel(
         compensations[idx] = compensation;
     }
 
-    ray_ts[idx] = ray_t;
-    ray_planes[idx * 2] = ray_plane.x;
-    ray_planes[idx * 2 + 1] = ray_plane.y;
-    normals[idx * 3] = normal.x;
-    normals[idx * 3 + 1] = normal.y;
-    normals[idx * 3 + 2] = normal.z;
+    if (radegs && ray_ts != nullptr && ray_planes != nullptr && normals != nullptr) {
+        ray_ts[idx] = ray_t;
+        ray_planes[idx * 2] = ray_plane.x;
+        ray_planes[idx * 2 + 1] = ray_plane.y;
+        normals[idx * 3] = normal.x;
+        normals[idx * 3 + 1] = normal.y;
+        normals[idx * 3 + 2] = normal.z;
+    }
 }
 
 void launch_projection_ewa_3dgs_fused_fwd_kernel(
@@ -250,9 +256,10 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel(
     at::Tensor depths,                     // [..., C, N]
     at::Tensor conics,                     // [..., C, N, 3]
     at::optional<at::Tensor> compensations, // [..., C, N] optional
-    at::Tensor ray_ts,                     // [..., C, N]
-    at::Tensor ray_planes,                 // [..., C, N, 2]
-    at::Tensor normals                     // [..., C, N, 3]
+    c10::optional<at::Tensor> ray_ts,      // [..., C, N]
+    c10::optional<at::Tensor> ray_planes,  // [..., C, N, 2]
+    c10::optional<at::Tensor> normals,     // [..., C, N, 3]
+    const bool radegs
 ) {
     uint32_t N = means.size(-2);    // number of gaussians
     uint32_t C = viewmats.size(-3); // number of cameras
@@ -305,9 +312,12 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel(
                     compensations.has_value()
                         ? compensations.value().data_ptr<scalar_t>()
                         : nullptr,
-                    ray_ts.data_ptr<scalar_t>(),
-                    ray_planes.data_ptr<scalar_t>(),
-                    normals.data_ptr<scalar_t>()
+                    ray_ts.has_value() ? ray_ts.value().data_ptr<scalar_t>() : nullptr,
+                    ray_planes.has_value()
+                        ? ray_planes.value().data_ptr<scalar_t>()
+                        : nullptr,
+                    normals.has_value() ? normals.value().data_ptr<scalar_t>() : nullptr,
+                    radegs
                 );
         }
     );
@@ -342,6 +352,7 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
     const scalar_t *__restrict__ v_ray_ts,       // [B, C, N] optional
     const scalar_t *__restrict__ v_ray_planes,   // [B, C, 2] optional
     const scalar_t *__restrict__ v_normals,      // [B, C, 3] optional
+    const bool radegs,
     // grad inputs
     scalar_t *__restrict__ v_means,   // [B, N, 3]
     scalar_t *__restrict__ v_covars,  // [B, N, 6] optional
@@ -368,9 +379,16 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
     v_means2d += idx * 2;
     v_depths += idx;
     v_conics += idx * 3;
-    v_ray_ts += idx;
-    v_ray_planes += idx * 2;
-    v_normals += idx * 3;
+    if (radegs && v_ray_ts != nullptr && v_ray_planes != nullptr &&
+        v_normals != nullptr) {
+        v_ray_ts += idx;
+        v_ray_planes += idx * 2;
+        v_normals += idx * 3;
+    } else {
+        v_ray_ts = nullptr;
+        v_ray_planes = nullptr;
+        v_normals = nullptr;
+    }
 
     // vjp: compute the inverse of the 2d covariance
     mat2 covar2d_inv = mat2(conics[0], conics[1], conics[1], conics[2]);
@@ -378,9 +396,14 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
         mat2(v_conics[0], v_conics[1] * .5f, v_conics[1] * .5f, v_conics[2]);
     mat2 v_covar2d(0.f);
     inverse_vjp(covar2d_inv, v_covar2d_inv, v_covar2d);
-    scalar_t v_ray_t = v_ray_ts[0];
-    vec2 v_ray_plane = vec2(v_ray_planes[0], v_ray_planes[1]);
-    vec3 v_normal = vec3(v_normals[0], v_normals[1], v_normals[2]);
+    scalar_t v_ray_t = 0.f;
+    vec2 v_ray_plane = vec2(0.f, 0.f);
+    vec3 v_normal = vec3(0.f, 0.f, 0.f);
+    if (radegs && v_ray_ts != nullptr) {
+        v_ray_t = v_ray_ts[0];
+        v_ray_plane = vec2(v_ray_planes[0], v_ray_planes[1]);
+        v_normal = vec3(v_normals[0], v_normals[1], v_normals[2]);
+    }
 
     if (v_compensations != nullptr) {
         // vjp: compensation term
@@ -450,8 +473,8 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
             image_height,
             v_covar2d,
             glm::make_vec2(v_means2d),
-            v_ray_plane,
-            v_normal,
+            radegs ? &v_ray_plane : nullptr,
+            radegs ? &v_normal : nullptr,
             v_mean_c,
             v_covar_c
         );
@@ -492,7 +515,9 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
 
     // add contribution from v_depths
     v_mean_c.z += v_depths[0];
-    v_mean_c += (float)v_ray_t * glm::normalize(mean_c);
+    if (radegs && v_ray_ts != nullptr) {
+        v_mean_c += (float)v_ray_t * glm::normalize(mean_c);
+    }
 
     // vjp: transform Gaussian covariance to camera space
     vec3 v_mean(0.f);
@@ -588,10 +613,11 @@ void launch_projection_ewa_3dgs_fused_bwd_kernel(
     const at::Tensor v_depths,                      // [..., C, N]
     const at::Tensor v_conics,                      // [..., C, N, 3]
     const at::optional<at::Tensor> v_compensations, // [..., C, N] optional
-    const at::optional<at::Tensor> v_ray_ts,       // [..., C, N] optional
-    const at::optional<at::Tensor> v_ray_planes,   // [..., C, N, 2] optional
-    const at::optional<at::Tensor> v_normals,      // [..., C, N, 3] optional
+    const c10::optional<at::Tensor> v_ray_ts,       // [..., C, N] optional
+    const c10::optional<at::Tensor> v_ray_planes,   // [..., C, N, 2] optional
+    const c10::optional<at::Tensor> v_normals,      // [..., C, N, 3] optional
     const bool viewmats_requires_grad,
+    const bool radegs,
     // outputs
     at::Tensor v_means,   // [..., N, 3]
     at::Tensor v_covars,  // [..., N, 3, 3]
@@ -665,7 +691,8 @@ void launch_projection_ewa_3dgs_fused_bwd_kernel(
                     covars.has_value() ? nullptr
                                        : v_scales.data_ptr<scalar_t>(),
                     viewmats_requires_grad ? v_viewmats.data_ptr<scalar_t>()
-                                           : nullptr
+                                           : nullptr,
+                    radegs
                 );
         }
     );

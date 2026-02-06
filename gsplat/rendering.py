@@ -134,6 +134,7 @@ def rasterization(
     covars: Optional[Tensor] = None,
     with_ut: bool = False,
     with_eval3d: bool = False,
+    RadeGS: bool = False,
     # distortion
     radial_coeffs: Optional[Tensor] = None,  # [..., C, 6] or [..., C, 4]
     tangential_coeffs: Optional[Tensor] = None,  # [..., C, 2]
@@ -298,6 +299,8 @@ def rasterization(
         rolling_shutter: The rolling shutter type. Default `RollingShutterType.GLOBAL` means
             global shutter.
         viewmats_rs: The second viewmat when rolling shutter is used. Default is None.
+        RadeGS: If True, enable Rade-GS outputs (expected/median depth and expected normals) and
+            ray-aware rasterization. If False, matches legacy rasterization behavior.
 
     Returns:
         A tuple:
@@ -381,9 +384,9 @@ def rasterization(
             and colors.shape[:-1] == batch_dims + (C, N)
         ), colors.shape
         if distributed:
-            assert (
-                colors.dim() == num_batch_dims + 2
-            ), "Distributed mode only supports per-Gaussian colors."
+            assert colors.dim() == num_batch_dims + 2, (
+                "Distributed mode only supports per-Gaussian colors."
+            )
     else:
         # treat colors as SH coefficients, should be in shape [..., N, K, 3] or [..., C, N, K, 3]
         # Allowing for activating partial SH bands
@@ -398,9 +401,9 @@ def rasterization(
         ), colors.shape
         assert (sh_degree + 1) ** 2 <= colors.shape[-2], colors.shape
         if distributed:
-            assert (
-                colors.dim() == num_batch_dims + 3
-            ), "Distributed mode only supports per-Gaussian colors."
+            assert colors.dim() == num_batch_dims + 3, (
+                "Distributed mode only supports per-Gaussian colors."
+            )
 
     if absgrad:
         assert not distributed, "AbsGrad is not supported in distributed mode."
@@ -412,23 +415,23 @@ def rasterization(
         or ftheta_coeffs is not None
         or rolling_shutter != RollingShutterType.GLOBAL
     ):
-        assert (
-            with_ut
-        ), "Distortion and rolling shutter are only supported with `with_ut=True`."
+        assert with_ut, (
+            "Distortion and rolling shutter are only supported with `with_ut=True`."
+        )
 
     if rolling_shutter != RollingShutterType.GLOBAL:
-        assert (
-            viewmats_rs is not None
-        ), "Rolling shutter requires to provide viewmats_rs."
+        assert viewmats_rs is not None, (
+            "Rolling shutter requires to provide viewmats_rs."
+        )
     else:
-        assert (
-            viewmats_rs is None
-        ), "viewmats_rs should be None for global rolling shutter."
+        assert viewmats_rs is None, (
+            "viewmats_rs should be None for global rolling shutter."
+        )
 
     if with_ut or with_eval3d:
-        assert (quats is not None) and (
-            scales is not None
-        ), "UT and eval3d requires to provide quats and scales."
+        assert (quats is not None) and (scales is not None), (
+            "UT and eval3d requires to provide quats and scales."
+        )
         assert packed is False, "Packed mode is not supported with UT."
         assert sparse_grad is False, "Sparse grad is not supported with UT."
 
@@ -499,31 +502,61 @@ def rasterization(
             calc_compensations=(rasterize_mode == "antialiased"),
             camera_model=camera_model,
             opacities=opacities,  # use opacities to compute a tigher bound for radii.
+            radegs=RadeGS,
         )
 
     if packed:
         # The results are packed into shape [nnz, ...]. All elements are valid.
-        (
-            batch_ids,
-            camera_ids,
-            gaussian_ids,
-            indptr,
-            radii,
-            means2d,
-            depths,
-            conics,
-            compensations,
-            ray_ts,
-            ray_planes,
-            normals,
-        ) = proj_results
+        if RadeGS:
+            (
+                batch_ids,
+                camera_ids,
+                gaussian_ids,
+                indptr,
+                radii,
+                means2d,
+                depths,
+                conics,
+                compensations,
+                ray_ts,
+                ray_planes,
+                normals,
+            ) = proj_results
+        else:
+            (
+                batch_ids,
+                camera_ids,
+                gaussian_ids,
+                indptr,
+                radii,
+                means2d,
+                depths,
+                conics,
+                compensations,
+            ) = proj_results
+            ray_ts = None
+            ray_planes = None
+            normals = None
         opacities = opacities.view(B, N)[batch_ids, gaussian_ids]  # [nnz]
         image_ids = batch_ids * C + camera_ids
     else:
         # The results are with shape [..., C, N, ...]. Only the elements with radii > 0 are valid.
-        radii, means2d, depths, conics, compensations, ray_ts, ray_planes, normals = (
-            proj_results
-        )
+        if RadeGS:
+            (
+                radii,
+                means2d,
+                depths,
+                conics,
+                compensations,
+                ray_ts,
+                ray_planes,
+                normals,
+            ) = proj_results
+        else:
+            radii, means2d, depths, conics, compensations = proj_results
+            ray_ts = None
+            ray_planes = None
+            normals = None
         opacities = torch.broadcast_to(
             opacities[..., None, :], batch_dims + (C, N)
         )  # [..., C, N]
@@ -788,40 +821,61 @@ def rasterization(
                     viewmats_rs=viewmats_rs,
                 )
             else:
-                (
-                    render_colors_,
-                    render_alphas_,
-                    expected_depths_,
-                    median_depths_,
-                    expected_normals_,
-                ) = rasterize_to_pixels(
-                    means2d,
-                    conics,
-                    colors_chunk,
-                    opacities,
-                    ray_ts,
-                    ray_planes,
-                    normals,
-                    width,
-                    height,
-                    tile_size,
-                    isect_offsets,
-                    flatten_ids,
-                    Ks=Ks,
-                    backgrounds=backgrounds_chunk,
-                    packed=packed,
-                    absgrad=absgrad,
-                )
-                meta.update(
-                    {
-                        "expected_depths": expected_depths_
-                        / render_alphas_.clamp(min=1e-10),
-                        "median_depths": median_depths_,
-                        "expected_normals": torch.nn.functional.normalize(
-                            expected_normals_, dim=-1
-                        ),
-                    }
-                )
+                if RadeGS:
+                    (
+                        render_colors_,
+                        render_alphas_,
+                        expected_depths_,
+                        median_depths_,
+                        expected_normals_,
+                    ) = rasterize_to_pixels(
+                        means2d,
+                        conics,
+                        colors_chunk,
+                        opacities,
+                        ray_ts,
+                        ray_planes,
+                        normals,
+                        width,
+                        height,
+                        tile_size,
+                        isect_offsets,
+                        flatten_ids,
+                        Ks=Ks,
+                        backgrounds=backgrounds_chunk,
+                        packed=packed,
+                        absgrad=absgrad,
+                        radegs=True,
+                    )
+                    meta.update(
+                        {
+                            "expected_depths": expected_depths_
+                            / render_alphas_.clamp(min=1e-10),
+                            "median_depths": median_depths_,
+                            "expected_normals": torch.nn.functional.normalize(
+                                expected_normals_, dim=-1
+                            ),
+                        }
+                    )
+                else:
+                    render_colors_, render_alphas_, *_ = rasterize_to_pixels(
+                        means2d,
+                        conics,
+                        colors_chunk,
+                        opacities,
+                        None,
+                        None,
+                        None,
+                        width,
+                        height,
+                        tile_size,
+                        isect_offsets,
+                        flatten_ids,
+                        backgrounds=backgrounds_chunk,
+                        packed=packed,
+                        absgrad=absgrad,
+                        radegs=False,
+                    )
             render_colors.append(render_colors_)
             render_alphas.append(render_alphas_)
 
@@ -852,39 +906,61 @@ def rasterization(
                 viewmats_rs=viewmats_rs,
             )
         else:
-            (
-                render_colors,
-                render_alphas,
-                expected_depths,
-                median_depths_,
-                expected_normals_,
-            ) = rasterize_to_pixels(
-                means2d,
-                conics,
-                colors,
-                opacities,
-                ray_ts,
-                ray_planes,
-                normals,
-                width,
-                height,
-                tile_size,
-                isect_offsets,
-                flatten_ids,
-                Ks=Ks,
-                backgrounds=backgrounds,
-                packed=packed,
-                absgrad=absgrad,
-            )
-            meta.update(
-                {
-                    "expected_depths": expected_depths / render_alphas.clamp(min=1e-10),
-                    "median_depths": median_depths_,
-                    "expected_normals": torch.nn.functional.normalize(
-                        expected_normals_, dim=-1
-                    ),
-                }
-            )
+            if RadeGS:
+                (
+                    render_colors,
+                    render_alphas,
+                    expected_depths,
+                    median_depths_,
+                    expected_normals_,
+                ) = rasterize_to_pixels(
+                    means2d,
+                    conics,
+                    colors,
+                    opacities,
+                    ray_ts,
+                    ray_planes,
+                    normals,
+                    width,
+                    height,
+                    tile_size,
+                    isect_offsets,
+                    flatten_ids,
+                    Ks=Ks,
+                    backgrounds=backgrounds,
+                    packed=packed,
+                    absgrad=absgrad,
+                    radegs=True,
+                )
+                meta.update(
+                    {
+                        "expected_depths": expected_depths
+                        / render_alphas.clamp(min=1e-10),
+                        "median_depths": median_depths_,
+                        "expected_normals": torch.nn.functional.normalize(
+                            expected_normals_, dim=-1
+                        ),
+                    }
+                )
+            else:
+                render_colors, render_alphas, *_ = rasterize_to_pixels(
+                    means2d,
+                    conics,
+                    colors,
+                    opacities,
+                    None,
+                    None,
+                    None,
+                    width,
+                    height,
+                    tile_size,
+                    isect_offsets,
+                    flatten_ids,
+                    backgrounds=backgrounds,
+                    packed=packed,
+                    absgrad=absgrad,
+                    radegs=False,
+                )
     if render_mode in ["ED", "RGB+ED"]:
         # normalize the accumulated depth to get the expected depth
         render_colors = torch.cat(
@@ -1542,7 +1618,9 @@ def rasterization_2dgs(
             "ED",
             "RGB+D",
             "RGB+ED",
-        ], f"distloss requires depth rendering, render_mode should be D, ED, RGB+D, RGB+ED, but got {render_mode}"
+        ], (
+            f"distloss requires depth rendering, render_mode should be D, ED, RGB+D, RGB+ED, but got {render_mode}"
+        )
 
     if sh_degree is None:
         # treat colors as post-activation values, should be in shape [..., N, D] or [..., C, N, D]

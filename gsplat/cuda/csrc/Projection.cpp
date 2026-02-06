@@ -5,11 +5,12 @@
 
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
+#include <c10/util/Optional.h>
 
+#include "Cameras.h"
 #include "Common.h"     // where all the macros are defined
 #include "Ops.h"        // a collection of all gsplat operators
 #include "Projection.h" // where the launch function is declared
-#include "Cameras.h"
 
 namespace gsplat {
 
@@ -34,7 +35,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> projection_ewa_simple
     at::DimVector means2d_shape(batch_dims);
     means2d_shape.append({C, N, 2});
     at::Tensor means2d = at::empty(means2d_shape, opt);
-    
+
     at::DimVector covars2d_shape(batch_dims);
     covars2d_shape.append({C, N, 2, 2});
     at::Tensor covars2d = at::empty(covars2d_shape, opt);
@@ -71,10 +72,10 @@ std::tuple<at::Tensor, at::Tensor> projection_ewa_simple_bwd(
     const uint32_t width,
     const uint32_t height,
     const CameraModelType camera_model,
-    const at::Tensor v_means2d, // [..., C, N, 2]
-    const at::Tensor v_covars2d, // [..., C, N, 2, 2]
+    const at::Tensor v_means2d,    // [..., C, N, 2]
+    const at::Tensor v_covars2d,   // [..., C, N, 2, 2]
     const at::Tensor v_ray_planes, // [..., C, 2] optional
-    const at::Tensor v_normals // [..., C, 3] optional
+    const at::Tensor v_normals     // [..., C, 3] optional
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -127,13 +128,13 @@ std::tuple<
     at::Tensor,
     at::Tensor>
 projection_ewa_3dgs_fused_fwd(
-    const at::Tensor means,                // [..., N, 3]
-    const at::optional<at::Tensor> covars, // [..., N, 6] optional
-    const at::optional<at::Tensor> quats,  // [..., N, 4] optional
-    const at::optional<at::Tensor> scales, // [..., N, 3] optional
+    const at::Tensor means,                   // [..., N, 3]
+    const at::optional<at::Tensor> covars,    // [..., N, 6] optional
+    const at::optional<at::Tensor> quats,     // [..., N, 4] optional
+    const at::optional<at::Tensor> scales,    // [..., N, 3] optional
     const at::optional<at::Tensor> opacities, // [..., N] optional
-    const at::Tensor viewmats,             // [..., C, 4, 4]
-    const at::Tensor Ks,                   // [..., C, 3, 3]
+    const at::Tensor viewmats,                // [..., C, 4, 4]
+    const at::Tensor Ks,                      // [..., C, 3, 3]
     const uint32_t image_width,
     const uint32_t image_height,
     const float eps2d,
@@ -141,7 +142,8 @@ projection_ewa_3dgs_fused_fwd(
     const float far_plane,
     const float radius_clip,
     const bool calc_compensations,
-    const CameraModelType camera_model
+    const CameraModelType camera_model,
+    const bool radegs
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -179,9 +181,24 @@ projection_ewa_3dgs_fused_fwd(
         compensations_shape.append({C, N});
         compensations = at::zeros(compensations_shape, opt);
     }
-    at::Tensor ray_ts = at::empty({C, N}, opt);
-    at::Tensor ray_planes = at::empty({C, N, 2}, opt);
-    at::Tensor normals = at::empty({C, N, 3}, opt);
+    at::Tensor ray_ts;
+    at::Tensor ray_planes;
+    at::Tensor normals;
+    c10::optional<at::Tensor> ray_ts_opt = c10::nullopt;
+    c10::optional<at::Tensor> ray_planes_opt = c10::nullopt;
+    c10::optional<at::Tensor> normals_opt = c10::nullopt;
+    if (radegs) {
+        ray_ts = at::empty({C, N}, opt);
+        ray_planes = at::empty({C, N, 2}, opt);
+        normals = at::empty({C, N, 3}, opt);
+        ray_ts_opt = ray_ts;
+        ray_planes_opt = ray_planes;
+        normals_opt = normals;
+    } else {
+        ray_ts = at::empty({0}, opt);
+        ray_planes = at::empty({0}, opt);
+        normals = at::empty({0}, opt);
+    }
 
     launch_projection_ewa_3dgs_fused_fwd_kernel(
         // inputs
@@ -206,11 +223,21 @@ projection_ewa_3dgs_fused_fwd(
         conics,
         calc_compensations ? at::optional<at::Tensor>(compensations)
                            : c10::nullopt,
+        ray_ts_opt,
+        ray_planes_opt,
+        normals_opt,
+        radegs
+    );
+    return std::make_tuple(
+        radii,
+        means2d,
+        depths,
+        conics,
+        compensations,
         ray_ts,
         ray_planes,
         normals
     );
-    return std::make_tuple(radii, means2d, depths, conics, compensations, ray_ts, ray_planes, normals);
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
@@ -235,10 +262,11 @@ projection_ewa_3dgs_fused_bwd(
     const at::Tensor v_depths,                      // [..., C, N]
     const at::Tensor v_conics,                      // [..., C, N, 3]
     const at::optional<at::Tensor> v_compensations, // [..., C, N] optional
-    const at::optional<at::Tensor> v_ray_ts,       // [..., C, N] optional
-    const at::optional<at::Tensor> v_ray_planes,   // [..., C, N, 2] optional
-    const at::optional<at::Tensor> v_normals,      // [..., C, N, 3] optional
-    const bool viewmats_requires_grad
+    const at::optional<at::Tensor> v_ray_ts,        // [..., C, N] optional
+    const at::optional<at::Tensor> v_ray_planes,    // [..., C, N, 2] optional
+    const at::optional<at::Tensor> v_normals,       // [..., C, N, 3] optional
+    const bool viewmats_requires_grad,
+    const bool radegs
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -259,16 +287,18 @@ projection_ewa_3dgs_fused_bwd(
     if (compensations.has_value()) {
         CHECK_INPUT(compensations.value());
     }
-    if (v_ray_ts.has_value()) {
-        CHECK_INPUT(v_ray_ts.value());
+    if (radegs) {
+        if (v_ray_ts.has_value()) {
+            CHECK_INPUT(v_ray_ts.value());
+        }
+        if (v_ray_planes.has_value()) {
+            CHECK_INPUT(v_ray_planes.value());
+        }
+        if (v_normals.has_value()) {
+            CHECK_INPUT(v_normals.value());
+        }
     }
-    if (v_ray_planes.has_value()) {
-        CHECK_INPUT(v_ray_planes.value());
-    }
-    if (v_normals.has_value()) {
-        CHECK_INPUT(v_normals.value());
-    }
-   
+
     if (v_compensations.has_value()) {
         CHECK_INPUT(v_compensations.value());
         assert(compensations.has_value());
@@ -310,6 +340,7 @@ projection_ewa_3dgs_fused_bwd(
         v_ray_planes,
         v_normals,
         viewmats_requires_grad,
+        radegs,
         // outputs
         v_means,
         v_covars,
@@ -335,13 +366,13 @@ std::tuple<
     at::Tensor,
     at::Tensor>
 projection_ewa_3dgs_packed_fwd(
-    const at::Tensor means,                // [..., N, 3]
-    const at::optional<at::Tensor> covars, // [..., N, 6] optional
-    const at::optional<at::Tensor> quats,  // [..., N, 4] optional
-    const at::optional<at::Tensor> scales, // [..., N, 3] optional
+    const at::Tensor means,                   // [..., N, 3]
+    const at::optional<at::Tensor> covars,    // [..., N, 6] optional
+    const at::optional<at::Tensor> quats,     // [..., N, 4] optional
+    const at::optional<at::Tensor> scales,    // [..., N, 3] optional
     const at::optional<at::Tensor> opacities, // [..., N] optional
-    const at::Tensor viewmats,             // [..., C, 4, 4]
-    const at::Tensor Ks,                   // [..., C, 3, 3]
+    const at::Tensor viewmats,                // [..., C, 4, 4]
+    const at::Tensor Ks,                      // [..., C, 3, 3]
     const uint32_t image_width,
     const uint32_t image_height,
     const float eps2d,
@@ -349,7 +380,8 @@ projection_ewa_3dgs_packed_fwd(
     const float far_plane,
     const float radius_clip,
     const bool calc_compensations,
-    const CameraModelType camera_model
+    const CameraModelType camera_model,
+    const bool radegs
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -405,7 +437,8 @@ projection_ewa_3dgs_packed_fwd(
             c10::nullopt, // means2d
             c10::nullopt, // depths
             c10::nullopt, // conics
-            // pass in as an indicator on whether compensation will be applied or not.
+            // pass in as an indicator on whether compensation will be applied
+            // or not.
             calc_compensations ? at::optional<at::Tensor>(at::empty({1}, opt))
                                : c10::nullopt,
             c10::nullopt, // ray_ts
@@ -427,9 +460,24 @@ projection_ewa_3dgs_packed_fwd(
     at::Tensor means2d = at::empty({nnz, 2}, opt);
     at::Tensor depths = at::empty({nnz}, opt);
     at::Tensor conics = at::empty({nnz, 3}, opt);
-    at::Tensor ray_ts = at::empty({nnz}, opt);
-    at::Tensor ray_planes = at::empty({nnz, 2}, opt);
-    at::Tensor normals = at::empty({nnz, 3}, opt);
+    at::Tensor ray_ts;
+    at::Tensor ray_planes;
+    at::Tensor normals;
+    c10::optional<at::Tensor> ray_ts_opt = c10::nullopt;
+    c10::optional<at::Tensor> ray_planes_opt = c10::nullopt;
+    c10::optional<at::Tensor> normals_opt = c10::nullopt;
+    if (radegs) {
+        ray_ts = at::empty({nnz}, opt);
+        ray_planes = at::empty({nnz, 2}, opt);
+        normals = at::empty({nnz, 3}, opt);
+        ray_ts_opt = ray_ts;
+        ray_planes_opt = ray_planes;
+        normals_opt = normals;
+    } else {
+        ray_ts = at::empty({0}, opt);
+        ray_planes = at::empty({0}, opt);
+        normals = at::empty({0}, opt);
+    }
     at::Tensor compensations;
     if (calc_compensations) {
         // we dont want NaN to appear in this tensor, so we zero intialize it
@@ -466,9 +514,10 @@ projection_ewa_3dgs_packed_fwd(
             conics,
             calc_compensations ? at::optional<at::Tensor>(compensations)
                                : c10::nullopt,
-            ray_ts,
-            ray_planes,
-            normals
+            ray_ts_opt,
+            ray_planes_opt,
+            normals_opt,
+            radegs
         );
     } else {
         indptr.fill_(0);
@@ -504,21 +553,22 @@ projection_ewa_3dgs_packed_bwd(
     const float eps2d,
     const CameraModelType camera_model,
     // fwd outputs
-    const at::Tensor batch_ids,                     // [nnz]
-    const at::Tensor camera_ids,                    // [nnz]
-    const at::Tensor gaussian_ids,                  // [nnz]
-    const at::Tensor conics,                        // [nnz, 3]
-    const at::optional<at::Tensor> compensations,   // [nnz] optional
+    const at::Tensor batch_ids,                   // [nnz]
+    const at::Tensor camera_ids,                  // [nnz]
+    const at::Tensor gaussian_ids,                // [nnz]
+    const at::Tensor conics,                      // [nnz, 3]
+    const at::optional<at::Tensor> compensations, // [nnz] optional
     // grad outputs
     const at::Tensor v_means2d,                     // [nnz, 2]
     const at::Tensor v_depths,                      // [nnz]
     const at::Tensor v_conics,                      // [nnz, 3]
     const at::optional<at::Tensor> v_compensations, // [nnz] optional
-    const at::optional<at::Tensor> v_ray_ts,       // [nnz] optional
-    const at::optional<at::Tensor> v_ray_planes,   // [nnz, 2] optional
-    const at::optional<at::Tensor> v_normals,      // [nnz, 3] optional
+    const at::optional<at::Tensor> v_ray_ts,        // [nnz] optional
+    const at::optional<at::Tensor> v_ray_planes,    // [nnz, 2] optional
+    const at::optional<at::Tensor> v_normals,       // [nnz, 3] optional
     const bool viewmats_requires_grad,
-    const bool sparse_grad
+    const bool sparse_grad,
+    const bool radegs
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -538,14 +588,16 @@ projection_ewa_3dgs_packed_bwd(
     CHECK_INPUT(v_means2d);
     CHECK_INPUT(v_depths);
     CHECK_INPUT(v_conics);
-    if (v_ray_ts.has_value()) {
-        CHECK_INPUT(v_ray_ts.value());
-    }
-    if (v_ray_planes.has_value()) {
-        CHECK_INPUT(v_ray_planes.value());
-    }
-    if (v_normals.has_value()) {
-        CHECK_INPUT(v_normals.value());
+    if (radegs) {
+        if (v_ray_ts.has_value()) {
+            CHECK_INPUT(v_ray_ts.value());
+        }
+        if (v_ray_planes.has_value()) {
+            CHECK_INPUT(v_ray_planes.value());
+        }
+        if (v_normals.has_value()) {
+            CHECK_INPUT(v_normals.value());
+        }
     }
     if (compensations.has_value()) {
         CHECK_INPUT(compensations.value());
@@ -606,6 +658,7 @@ projection_ewa_3dgs_packed_bwd(
         v_ray_planes,
         v_normals,
         sparse_grad,
+        radegs,
         // outputs
         v_means,
         v_covars.defined() ? at::optional<at::Tensor>(v_covars) : c10::nullopt,
@@ -645,8 +698,8 @@ projection_2dgs_fused_fwd(
 
     auto opt = means.options();
     at::DimVector batch_dims(means.sizes().slice(0, means.dim() - 2));
-    uint32_t N = means.size(-2);          // number of gaussians
-    uint32_t C = viewmats.size(-3);       // number of cameras
+    uint32_t N = means.size(-2);    // number of gaussians
+    uint32_t C = viewmats.size(-3); // number of cameras
 
     at::DimVector radii_shape(batch_dims);
     radii_shape.append({C, N, 2});
@@ -943,7 +996,7 @@ projection_2dgs_packed_bwd(
     if (viewmats_requires_grad) {
         v_viewmats = at::zeros_like(viewmats, opt);
     }
-    
+
     launch_projection_2dgs_packed_bwd_kernel(
         // fwd inputs
         means,
@@ -986,8 +1039,9 @@ projection_ut_3dgs_fused(
     const at::Tensor scales,                  // [..., N, 3]
     const at::optional<at::Tensor> opacities, // [..., N] optional
     const at::Tensor viewmats0,               // [..., C, 4, 4]
-    const at::optional<at::Tensor> viewmats1, // [..., C, 4, 4] optional for rolling shutter
-    const at::Tensor Ks,                      // [..., C, 3, 3]
+    const at::optional<at::Tensor>
+        viewmats1,       // [..., C, 4, 4] optional for rolling shutter
+    const at::Tensor Ks, // [..., C, 3, 3]
     const uint32_t image_width,
     const uint32_t image_height,
     const float eps2d,
@@ -999,10 +1053,12 @@ projection_ut_3dgs_fused(
     // uncented transform
     const UnscentedTransformParameters ut_params,
     ShutterType rs_type,
-    const at::optional<at::Tensor> radial_coeffs,     // [..., C, 6] or [..., C, 4] optional
+    const at::optional<at::Tensor>
+        radial_coeffs, // [..., C, 6] or [..., C, 4] optional
     const at::optional<at::Tensor> tangential_coeffs, // [..., C, 2] optional
-    const at::optional<at::Tensor> thin_prism_coeffs,  // [..., C, 4] optional
-    const FThetaCameraDistortionParameters ftheta_coeffs // shared parameters for all cameras
+    const at::optional<at::Tensor> thin_prism_coeffs, // [..., C, 4] optional
+    const FThetaCameraDistortionParameters
+        ftheta_coeffs // shared parameters for all cameras
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -1027,8 +1083,8 @@ projection_ut_3dgs_fused(
     }
 
     at::DimVector batch_dims(means.sizes().slice(0, means.dim() - 2));
-    uint32_t N = means.size(-2);    // number of gaussians
-    uint32_t C = Ks.size(-3);       // number of cameras
+    uint32_t N = means.size(-2); // number of gaussians
+    uint32_t C = Ks.size(-3);    // number of cameras
     auto opt = means.options();
 
     at::DimVector radii_shape(batch_dims);
@@ -1042,7 +1098,7 @@ projection_ut_3dgs_fused(
     at::DimVector depths_shape(batch_dims);
     depths_shape.append({C, N});
     at::Tensor depths = at::empty(depths_shape, opt);
-    
+
     at::DimVector conics_shape(batch_dims);
     conics_shape.append({C, N, 3});
     at::Tensor conics = at::empty(conics_shape, opt);

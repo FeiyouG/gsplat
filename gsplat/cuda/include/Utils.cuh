@@ -510,8 +510,8 @@ inline __device__ void persp_proj(
     // outputs
     mat2 &cov2d,
     vec2 &mean2d,
-    vec2 &ray_plane,
-    vec3 &normal
+    vec2 *ray_plane,
+    vec3 *normal
 ) {
     float x = mean3d[0], y = mean3d[1], z = mean3d[2];
 
@@ -541,78 +541,80 @@ inline __device__ void persp_proj(
     cov2d = J * cov3d * glm::transpose(J);
     mean2d = vec2({fx * x * rz + cx, fy * y * rz + cy});
 
-    // Compute ray space intersection plane
-    auto length = [](float x, float y, float z) {
-        return sqrt(x * x + y * y + z * z);
-    };
-    mat3 cov3d_eigen_vector;
-    vec3 cov3d_eigen_value;
-    int D = glm::findEigenvaluesSymReal(
-        cov3d, cov3d_eigen_value, cov3d_eigen_vector
-    );
-    unsigned int min_id =
-        cov3d_eigen_value[0] > cov3d_eigen_value[1]
-            ? (cov3d_eigen_value[1] > cov3d_eigen_value[2] ? 2 : 1)
-            : (cov3d_eigen_value[0] > cov3d_eigen_value[2] ? 2 : 0);
-    mat3 cov3d_inv;
-    bool well_conditioned = cov3d_eigen_value[min_id] > 1E-8;
-    vec3 eigenvector_min;
-    if (well_conditioned) {
-        mat3 diag = mat3(
-            1 / cov3d_eigen_value[0],
-            0,
-            0,
-            0,
-            1 / cov3d_eigen_value[1],
-            0,
-            0,
-            0,
-            1 / cov3d_eigen_value[2]
+    if (ray_plane != nullptr && normal != nullptr) {
+        // Compute ray space intersection plane
+        auto length = [](float x, float y, float z) {
+            return sqrt(x * x + y * y + z * z);
+        };
+        mat3 cov3d_eigen_vector;
+        vec3 cov3d_eigen_value;
+        int D = glm::findEigenvaluesSymReal(
+            cov3d, cov3d_eigen_value, cov3d_eigen_vector
         );
-        cov3d_inv =
-            cov3d_eigen_vector * diag * glm::transpose(cov3d_eigen_vector);
-    } else {
-        eigenvector_min = cov3d_eigen_vector[min_id];
-        cov3d_inv = glm::outerProduct(eigenvector_min, eigenvector_min);
-    }
-    vec3 uvh = {u, v, 1};
-    vec3 Cinv_uvh = cov3d_inv * uvh;
-    if (length(Cinv_uvh.x, Cinv_uvh.y, Cinv_uvh.z) < 1E-12 || D == 0) {
-        normal = {0, 0, 0};
-        ray_plane = {0, 0};
-    } else {
-        float l = length(tx, ty, z);
-        mat3 nJ_T = glm::mat3(
-            rz,
-            0.f,
-            -tx * rz2, // 1st column
-            0.f,
-            rz,
-            -ty * rz2, // 2nd column
-            tx / l,
-            ty / l,
-            z / l // 3rd column
-        );
-        float uu = u * u;
-        float vv = v * v;
-        float uv = u * v;
+        unsigned int min_id =
+            cov3d_eigen_value[0] > cov3d_eigen_value[1]
+                ? (cov3d_eigen_value[1] > cov3d_eigen_value[2] ? 2 : 1)
+                : (cov3d_eigen_value[0] > cov3d_eigen_value[2] ? 2 : 0);
+        mat3 cov3d_inv;
+        bool well_conditioned = cov3d_eigen_value[min_id] > 1E-8;
+        vec3 eigenvector_min;
+        if (well_conditioned) {
+            mat3 diag = mat3(
+                1 / cov3d_eigen_value[0],
+                0,
+                0,
+                0,
+                1 / cov3d_eigen_value[1],
+                0,
+                0,
+                0,
+                1 / cov3d_eigen_value[2]
+            );
+            cov3d_inv =
+                cov3d_eigen_vector * diag * glm::transpose(cov3d_eigen_vector);
+        } else {
+            eigenvector_min = cov3d_eigen_vector[min_id];
+            cov3d_inv = glm::outerProduct(eigenvector_min, eigenvector_min);
+        }
+        vec3 uvh = {u, v, 1};
+        vec3 Cinv_uvh = cov3d_inv * uvh;
+        if (length(Cinv_uvh.x, Cinv_uvh.y, Cinv_uvh.z) < 1E-12 || D == 0) {
+            *normal = {0, 0, 0};
+            *ray_plane = {0, 0};
+        } else {
+            float l = length(tx, ty, z);
+            mat3 nJ_T = glm::mat3(
+                rz,
+                0.f,
+                -tx * rz2, // 1st column
+                0.f,
+                rz,
+                -ty * rz2, // 2nd column
+                tx / l,
+                ty / l,
+                z / l // 3rd column
+            );
+            float uu = u * u;
+            float vv = v * v;
+            float uv = u * v;
 
-        mat3x2 nJ_inv_T = mat3x2(
-            vv + 1,
-            -uv, // 1st column
-            -uv,
-            uu + 1, // 2nd column
-            -u,
-            -v // 3nd column
-        );
-        float factor = l / (uu + vv + 1);
-        vec3 Cinv_uvh_n = glm::normalize(Cinv_uvh);
-        float u_Cinv_u_n_clmap = max(glm::dot(Cinv_uvh_n, uvh), 1E-7);
-        vec2 plane = nJ_inv_T * (Cinv_uvh_n / u_Cinv_u_n_clmap);
-        vec3 ray_normal_vector = {-plane.x * factor, -plane.y * factor, -1};
-        vec3 cam_normal_vector = nJ_T * ray_normal_vector;
-        normal = glm::normalize(cam_normal_vector);
-        ray_plane = {plane.x * factor / fx, plane.y * factor / fy};
+            mat3x2 nJ_inv_T = mat3x2(
+                vv + 1,
+                -uv, // 1st column
+                -uv,
+                uu + 1, // 2nd column
+                -u,
+                -v // 3nd column
+            );
+            float factor = l / (uu + vv + 1);
+            vec3 Cinv_uvh_n = glm::normalize(Cinv_uvh);
+            float u_Cinv_u_n_clmap = max(glm::dot(Cinv_uvh_n, uvh), 1E-7);
+            vec2 plane = nJ_inv_T * (Cinv_uvh_n / u_Cinv_u_n_clmap);
+            vec3 ray_normal_vector = {-plane.x * factor, -plane.y * factor, -1};
+            vec3 cam_normal_vector = nJ_T * ray_normal_vector;
+            *normal = glm::normalize(cam_normal_vector);
+            *ray_plane = {plane.x * factor / fx, plane.y * factor / fy};
+        }
     }
 }
 
@@ -629,13 +631,15 @@ inline __device__ void persp_proj_vjp(
     // grad outputs
     const mat2 v_cov2d,
     const vec2 v_mean2d,
-    const vec2 v_ray_plane,
-    const vec3 v_normal,
+    const vec2 *v_ray_plane,
+    const vec3 *v_normal,
     // grad inputs
     vec3 &v_mean3d,
     mat3 &v_cov3d
 ) {
     float x = mean3d[0], y = mean3d[1], z = mean3d[2];
+    vec2 v_ray_plane_val = v_ray_plane != nullptr ? *v_ray_plane : vec2(0.f);
+    vec3 v_normal_val = v_normal != nullptr ? *v_normal : vec3(0.f);
 
     float tan_fovx = 0.5f * width / fx;
     float tan_fovy = 0.5f * height / fy;
@@ -750,14 +754,14 @@ inline __device__ void persp_proj_vjp(
 
         float cam_normal_vector_length = glm::length(cam_normal_vector);
 
-        vec3 v_normal_l = v_normal / cam_normal_vector_length;
+        vec3 v_normal_l = v_normal_val / cam_normal_vector_length;
         vec3 v_cam_normal_vector =
             v_normal_l - normal * glm::dot(normal, v_normal_l);
         vec3 v_ray_normal_vector = glm::transpose(nJ_T) * v_cam_normal_vector;
         v_nJ_T = glm::outerProduct(v_cam_normal_vector, ray_normal_vector);
 
         vec2 ray_plane_uv = {plane.x * factor, plane.y * factor};
-        const vec2 v_ray_plane_uv = {v_ray_plane.x / fx, v_ray_plane.y / fy};
+        const vec2 v_ray_plane_uv = {v_ray_plane_val.x / fx, v_ray_plane_val.y / fy};
         v_l = glm::dot(
                   plane, -glm::make_vec2(v_ray_normal_vector) + v_ray_plane_uv
               ) /
@@ -769,7 +773,8 @@ inline __device__ void persp_proj_vjp(
         float v_nl =
             (-v_ray_normal_vector.x * ray_normal_vector.x -
              v_ray_normal_vector.y * ray_normal_vector.y -
-             v_ray_plane.x * ray_plane_uv.x - v_ray_plane.y * ray_plane_uv.y) /
+             v_ray_plane_val.x * ray_plane_uv.x -
+                 v_ray_plane_val.y * ray_plane_uv.y) /
             nl;
 
         float tmp = glm::dot(v_plane, plane);

@@ -55,7 +55,20 @@ __global__ void projection_ewa_simple_fwd_kernel(
 
     switch (camera_model) {
     case CameraModelType::PINHOLE: // perspective projection
-        persp_proj(mean, covar, fx, fy, cx, cy, width, height, covar2d, mean2d, ray_plane, normal);
+        persp_proj(
+            mean,
+            covar,
+            fx,
+            fy,
+            cx,
+            cy,
+            width,
+            height,
+            covar2d,
+            mean2d,
+            &ray_plane,
+            &normal
+        );
         break;
     case CameraModelType::ORTHO: // orthographic projection
         ortho_proj(mean, covar, fx, fy, cx, cy, width, height, covar2d, mean2d);
@@ -207,8 +220,8 @@ __global__ void projection_ewa_simple_bwd_kernel(
             height,
             glm::transpose(v_covar2d),
             v_mean2d,
-            v_ray_plane,
-            v_normal,
+            &v_ray_plane,
+            &v_normal,
             v_mean,
             v_covar
         );

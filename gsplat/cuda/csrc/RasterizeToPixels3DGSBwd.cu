@@ -57,7 +57,8 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     scalar_t *__restrict__ v_opacities, // [..., N] or [nnz]
     scalar_t *__restrict__ v_ray_ts,       // [..., N] or [nnz]
     scalar_t *__restrict__ v_ray_planes,   // [..., N, 2] or [nnz, 2]
-    scalar_t *__restrict__ v_normals      // [..., N, 3] or [nnz, 3]
+    scalar_t *__restrict__ v_normals,      // [..., N, 3] or [nnz, 3]
+    const bool radegs
 ) {
     auto block = cg::this_thread_block();
     uint32_t image_id = block.group_index().x;
@@ -71,10 +72,12 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     last_ids += image_id * image_height * image_width;
     v_render_colors += image_id * image_height * image_width * CDIM;
     v_render_alphas += image_id * image_height * image_width;
-    v_render_expected_depths += image_id * image_height * image_width;
-    v_render_median_depths += image_id * image_height * image_width;
-    v_render_expected_normals += image_id * image_height * image_width;
-    median_ids += image_id * image_height * image_width;
+    if (radegs && v_render_expected_depths != nullptr) {
+        v_render_expected_depths += image_id * image_height * image_width;
+        v_render_median_depths += image_id * image_height * image_width;
+        v_render_expected_normals += image_id * image_height * image_width;
+        median_ids += image_id * image_height * image_width;
+    }
 
     if (backgrounds != nullptr) {
         backgrounds += image_id * CDIM;
@@ -95,11 +98,13 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     const int32_t pix_id =
         min(i * image_width + j, image_width * image_height - 1);
 
-    float ln;
-    Ks += image_id * 9;
-    float fx = Ks[0], cx = Ks[2], fy = Ks[4], cy = Ks[5];
-    vec3 pixnf = {(px - cx) / fx, (py - cy) / fy, 1.f};
-    ln = glm::length(pixnf);
+    float ln = 1.f;
+    if (radegs && Ks != nullptr) {
+        Ks += image_id * 9;
+        float fx = Ks[0], cx = Ks[2], fy = Ks[4], cy = Ks[5];
+        vec3 pixnf = {(px - cx) / fx, (py - cy) / fy, 1.f};
+        ln = glm::length(pixnf);
+    }
 
     // keep not rasterizing threads around for reading data
     bool inside = (i < image_height && j < image_width);
@@ -151,13 +156,20 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     float v_render_et, v_render_mt;
     uint32_t median_idx;
     vec3 v_render_en;
-    float v_render_ed = v_render_expected_depths[pix_id];
-    v_render_et = v_render_ed / ln;
+    if (radegs && v_render_expected_depths != nullptr) {
+        float v_render_ed = v_render_expected_depths[pix_id];
+        v_render_et = v_render_ed / ln;
 
-    float v_render_md = v_render_median_depths[pix_id];
-    v_render_mt = v_render_md / ln;
-    v_render_en = v_render_expected_normals[pix_id];
-    median_idx = median_ids[pix_id];
+        float v_render_md = v_render_median_depths[pix_id];
+        v_render_mt = v_render_md / ln;
+        v_render_en = v_render_expected_normals[pix_id];
+        median_idx = median_ids[pix_id];
+    } else {
+        v_render_et = 0.f;
+        v_render_mt = 0.f;
+        v_render_en = {0.f, 0.f, 0.f};
+        median_idx = 0;
+    }
 
 
     // collect and process batches of gaussians
@@ -189,9 +201,11 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
             for (uint32_t k = 0; k < CDIM; ++k) {
                 rgbs_batch[tr * CDIM + k] = colors[g * CDIM + k];
             }
-            ray_t_batch[tr] = ray_ts[g];
-            ray_plane_batch[tr] = ray_planes[g];
-            normal_batch[tr] = normals[g];
+            if (radegs && ray_ts != nullptr && ray_planes != nullptr && normals != nullptr) {
+                ray_t_batch[tr] = ray_ts[g];
+                ray_plane_batch[tr] = ray_planes[g];
+                normal_batch[tr] = normals[g];
+            }
         }
         // wait for other threads to collect the gaussians in batch
         block.sync();
@@ -266,21 +280,24 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                     v_alpha += -T_final * ra * accum;
                 }
 
-                // depth/normal gradients (always computed, independent of backgrounds)
-                v_normal_local = fac * v_render_en;
-                v_alpha += glm::dot(normal_batch[t] * T - normal_buffer * ra, v_render_en);
-                normal_buffer += normal_batch[t] * fac;
+                if (radegs) {
+                    // depth/normal gradients (always computed, independent of backgrounds)
+                    v_normal_local = fac * v_render_en;
+                    v_alpha +=
+                        glm::dot(normal_batch[t] * T - normal_buffer * ra, v_render_en);
+                    normal_buffer += normal_batch[t] * fac;
 
-                v_ray_t_local = fac * v_render_et;
-                if (batch_end - t == median_idx) {
-                    v_ray_t_local += v_render_mt;
+                    v_ray_t_local = fac * v_render_et;
+                    if (batch_end - t == median_idx) {
+                        v_ray_t_local += v_render_mt;
+                    }
+                    v_ray_plane_local = v_ray_t_local * delta;
+                    const float ray_t = ray_t_batch[t];
+                    const vec2 ray_plane = ray_plane_batch[t];
+                    float t_opt = ray_t + glm::dot(delta, ray_plane);
+                    v_alpha += (t_opt * T - t_buffer * ra) * v_render_et;
+                    t_buffer += t_opt * fac;
                 }
-                v_ray_plane_local = v_ray_t_local * delta;
-                const float ray_t = ray_t_batch[t];
-                const vec2 ray_plane = ray_plane_batch[t];
-                float t_opt = ray_t + glm::dot(delta, ray_plane);
-                v_alpha += (t_opt * T - t_buffer * ra) * v_render_et;
-                t_buffer += t_opt * fac;
                 
 
 
@@ -339,15 +356,18 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                     gpuAtomicAdd(v_xy_abs_ptr + 1, v_xy_abs_local.y);
                 }
 
-                float *v_ray_t_ptr = (float *)(v_ray_ts) + g;
-                gpuAtomicAdd(v_ray_t_ptr, v_ray_t_local);
-                float *v_ray_plane_ptr = (float *)(v_ray_planes) + 2 * g;
-                gpuAtomicAdd(v_ray_plane_ptr, v_ray_plane_local.x);
-                gpuAtomicAdd(v_ray_plane_ptr + 1, v_ray_plane_local.y);
-                float *v_normal_ptr = (float *)(v_normals) + 3 * g;
-                gpuAtomicAdd(v_normal_ptr, v_normal_local.x);
-                gpuAtomicAdd(v_normal_ptr + 1, v_normal_local.y);
-                gpuAtomicAdd(v_normal_ptr + 2, v_normal_local.z);
+                if (radegs && v_ray_ts != nullptr && v_ray_planes != nullptr &&
+                    v_normals != nullptr) {
+                    float *v_ray_t_ptr = (float *)(v_ray_ts) + g;
+                    gpuAtomicAdd(v_ray_t_ptr, v_ray_t_local);
+                    float *v_ray_plane_ptr = (float *)(v_ray_planes) + 2 * g;
+                    gpuAtomicAdd(v_ray_plane_ptr, v_ray_plane_local.x);
+                    gpuAtomicAdd(v_ray_plane_ptr + 1, v_ray_plane_local.y);
+                    float *v_normal_ptr = (float *)(v_normals) + 3 * g;
+                    gpuAtomicAdd(v_normal_ptr, v_normal_local.x);
+                    gpuAtomicAdd(v_normal_ptr + 1, v_normal_local.y);
+                    gpuAtomicAdd(v_normal_ptr + 2, v_normal_local.z);
+                }
 
                 gpuAtomicAdd(v_opacities + g, v_opacity_local);
             }
@@ -362,38 +382,39 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     const at::Tensor conics,                    // [..., N, 3] or [nnz, 3]
     const at::Tensor colors,                    // [..., N, 3] or [nnz, 3]
     const at::Tensor opacities,                 // [..., N] or [nnz]
-    const at::Tensor ray_ts,                    // [..., N] or [nnz]
-    const at::Tensor ray_planes,                // [..., N, 2] or [nnz, 2]
-    const at::Tensor normals,                   // [..., N, 3] or [nnz, 3]
+    const c10::optional<at::Tensor> ray_ts,                    // [..., N] or [nnz]
+    const c10::optional<at::Tensor> ray_planes,                // [..., N, 2] or [nnz, 2]
+    const c10::optional<at::Tensor> normals,                   // [..., N, 3] or [nnz, 3]
     const at::optional<at::Tensor> backgrounds, // [..., 3]
     const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
     // image size
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
-    const at::Tensor Ks,            // [..., C, 9]
+    const c10::optional<at::Tensor> Ks,            // [..., C, 9]
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
     // forward outputs
     const at::Tensor render_alphas, // [..., image_height, image_width, 1]
     const at::Tensor last_ids,      // [..., image_height, image_width]
-    const at::Tensor median_ids,    // [..., image_height, image_width]
+    const c10::optional<at::Tensor> median_ids,    // [..., image_height, image_width]
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., image_height, image_width, 3]
     const at::Tensor v_render_alphas, // [..., image_height, image_width, 1]
-    const at::Tensor v_render_expected_depths, // [..., image_height, image_width, 1]
-    const at::Tensor v_render_median_depths, // [..., image_height, image_width, 1]
-    const at::Tensor v_render_expected_normals, // [..., image_height, image_width, 3]
+    const c10::optional<at::Tensor> v_render_expected_depths, // [..., image_height, image_width, 1]
+    const c10::optional<at::Tensor> v_render_median_depths, // [..., image_height, image_width, 1]
+    const c10::optional<at::Tensor> v_render_expected_normals, // [..., image_height, image_width, 3]
     // outputs
     at::optional<at::Tensor> v_means2d_abs, // [..., N, 2] or [nnz, 2]
     at::Tensor v_means2d,                   // [..., N, 2] or [nnz, 2]
     at::Tensor v_conics,                    // [..., N, 3] or [nnz, 3]
     at::Tensor v_colors,                    // [..., N, 3] or [nnz, 3]
     at::Tensor v_opacities,                  // [..., N] or [nnz]
-    at::Tensor v_ray_ts,                    // [..., N] or [nnz]
-    at::Tensor v_ray_planes,                // [..., N, 2] or [nnz, 2]
-    at::Tensor v_normals                    // [..., N, 3] or [nnz, 3]
+    c10::optional<at::Tensor> v_ray_ts,                    // [..., N] or [nnz]
+    c10::optional<at::Tensor> v_ray_planes,                // [..., N, 2] or [nnz, 2]
+    c10::optional<at::Tensor> v_normals,                   // [..., N, 3] or [nnz, 3]
+    const bool radegs
 ) {
     bool packed = means2d.dim() == 2;
 
@@ -442,9 +463,13 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
             reinterpret_cast<vec3 *>(conics.data_ptr<float>()),
             colors.data_ptr<float>(),
             opacities.data_ptr<float>(),
-            ray_ts.data_ptr<float>(),
-            reinterpret_cast<vec2 *>(ray_planes.data_ptr<float>()),
-            reinterpret_cast<vec3 *>(normals.data_ptr<float>()),
+            ray_ts.has_value() ? ray_ts.value().data_ptr<float>() : nullptr,
+            ray_planes.has_value()
+                ? reinterpret_cast<vec2 *>(ray_planes.value().data_ptr<float>())
+                : nullptr,
+            normals.has_value()
+                ? reinterpret_cast<vec3 *>(normals.value().data_ptr<float>())
+                : nullptr,
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
                                     : nullptr,
             masks.has_value() ? masks.value().data_ptr<bool>() : nullptr,
@@ -453,17 +478,25 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
             tile_size,
             tile_width,
             tile_height,
-            Ks.data_ptr<float>(),
+            Ks.has_value() ? Ks.value().data_ptr<float>() : nullptr,
             tile_offsets.data_ptr<int32_t>(),
             flatten_ids.data_ptr<int32_t>(),
             render_alphas.data_ptr<float>(),
             last_ids.data_ptr<int32_t>(),
-            median_ids.data_ptr<int32_t>(),
+            median_ids.has_value() ? median_ids.value().data_ptr<int32_t>() : nullptr,
             v_render_colors.data_ptr<float>(),
             v_render_alphas.data_ptr<float>(),
-            v_render_expected_depths.data_ptr<float>(),
-            v_render_median_depths.data_ptr<float>(),
-            reinterpret_cast<vec3 *>(v_render_expected_normals.data_ptr<float>()),
+            v_render_expected_depths.has_value()
+                ? v_render_expected_depths.value().data_ptr<float>()
+                : nullptr,
+            v_render_median_depths.has_value()
+                ? v_render_median_depths.value().data_ptr<float>()
+                : nullptr,
+            v_render_expected_normals.has_value()
+                ? reinterpret_cast<vec3 *>(
+                      v_render_expected_normals.value().data_ptr<float>()
+                  )
+                : nullptr,
             v_means2d_abs.has_value()
                 ? reinterpret_cast<vec2 *>(
                       v_means2d_abs.value().data_ptr<float>()
@@ -473,9 +506,10 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
             reinterpret_cast<vec3 *>(v_conics.data_ptr<float>()),
             v_colors.data_ptr<float>(),
             v_opacities.data_ptr<float>(),
-            v_ray_ts.data_ptr<float>(),
-            v_ray_planes.data_ptr<float>(),
-            v_normals.data_ptr<float>()
+            v_ray_ts.has_value() ? v_ray_ts.value().data_ptr<float>() : nullptr,
+            v_ray_planes.has_value() ? v_ray_planes.value().data_ptr<float>() : nullptr,
+            v_normals.has_value() ? v_normals.value().data_ptr<float>() : nullptr,
+            radegs
         );
 }
 
@@ -488,33 +522,34 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
         const at::Tensor conics,                                               \
         const at::Tensor colors,                                               \
         const at::Tensor opacities,                                            \
-        const at::Tensor ray_ts,                                               \
-        const at::Tensor ray_planes,                                           \
-        const at::Tensor normals,                                              \
+        const c10::optional<at::Tensor> ray_ts,                                \
+        const c10::optional<at::Tensor> ray_planes,                            \
+        const c10::optional<at::Tensor> normals,                               \
         const at::optional<at::Tensor> backgrounds,                            \
         const at::optional<at::Tensor> masks,                                  \
         uint32_t image_width,                                                  \
         uint32_t image_height,                                                 \
         uint32_t tile_size,                                                    \
-        const at::Tensor Ks,                                                   \
+        const c10::optional<at::Tensor> Ks,                                    \
         const at::Tensor tile_offsets,                                         \
         const at::Tensor flatten_ids,                                          \
         const at::Tensor render_alphas,                                        \
         const at::Tensor last_ids,                                             \
-        const at::Tensor median_ids,                                           \
+        const c10::optional<at::Tensor> median_ids,                            \
         const at::Tensor v_render_colors,                                      \
         const at::Tensor v_render_alphas,                                      \
-        const at::Tensor v_render_expected_depths,                             \
-        const at::Tensor v_render_median_depths,                               \
-        const at::Tensor v_render_expected_normals,                            \
-        at::optional<at::Tensor> v_means2d_abs,                                \
+        const c10::optional<at::Tensor> v_render_expected_depths,              \
+        const c10::optional<at::Tensor> v_render_median_depths,                \
+        const c10::optional<at::Tensor> v_render_expected_normals,             \
+        c10::optional<at::Tensor> v_means2d_abs,                               \
         at::Tensor v_means2d,                                                  \
         at::Tensor v_conics,                                                   \
         at::Tensor v_colors,                                                   \
         at::Tensor v_opacities,                                                \
-        at::Tensor v_ray_ts,                                                   \
-        at::Tensor v_ray_planes,                                               \
-        at::Tensor v_normals                                                   \
+        c10::optional<at::Tensor> v_ray_ts,                                    \
+        c10::optional<at::Tensor> v_ray_planes,                                \
+        c10::optional<at::Tensor> v_normals,                                   \
+        const bool radegs                                                      \
     );
 
 __INS__(1)
