@@ -59,10 +59,10 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     tile_offsets += image_id * tile_height * tile_width;
     render_colors += image_id * image_height * image_width * CDIM;
     render_alphas += image_id * image_height * image_width;
-    // expected_depths += image_id * image_height * image_width;
-    // median_depths += image_id * image_height * image_width;
-    // expected_normals += image_id * image_height * image_width * 3;
-    // median_ids += image_id * image_height * image_width;
+    render_depths += image_id * image_height * image_width;
+    median_depths += image_id * image_height * image_width;
+    render_normals += image_id * image_height * image_width * 3;
+    median_ids += image_id * image_height * image_width;
     last_ids += image_id * image_height * image_width;
     if (backgrounds != nullptr) {
         backgrounds += image_id * CDIM;

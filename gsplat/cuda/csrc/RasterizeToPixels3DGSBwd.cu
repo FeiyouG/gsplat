@@ -71,6 +71,11 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     last_ids += image_id * image_height * image_width;
     v_render_colors += image_id * image_height * image_width * CDIM;
     v_render_alphas += image_id * image_height * image_width;
+    v_render_expected_depths += image_id * image_height * image_width;
+    v_render_median_depths += image_id * image_height * image_width;
+    v_render_expected_normals += image_id * image_height * image_width;
+    median_ids += image_id * image_height * image_width;
+
     if (backgrounds != nullptr) {
         backgrounds += image_id * CDIM;
     }
